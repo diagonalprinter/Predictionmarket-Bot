@@ -1,3 +1,2 @@
 streamlit
 requests
-py-clob-client-crypto
