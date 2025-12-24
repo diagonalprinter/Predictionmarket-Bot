@@ -3,7 +3,7 @@ import requests
 import time
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
-from py_clob_client.constants import BUY, GTC  # Both here in the fork
+from py_clob_client.constants import BUY, GTC 
 
 # Constants
 GAMMA_API = "https://gamma-api.polymarket.com/markets"
