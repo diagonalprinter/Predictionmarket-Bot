@@ -1,137 +1,168 @@
 import streamlit as st
 import requests
 import time
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
-from py_clob_client.constants import BUY, GTC 
 
+# ======================
 # Constants
+# ======================
 GAMMA_API = "https://gamma-api.polymarket.com/markets"
-CLOB_HOST = "https://clob.polymarket.com"
-CHAIN_ID = 137  # Polygon
+CLOB_ORDERBOOK = "https://clob.polymarket.com/orderbook"
 
-# Read-only client for public data
-public_client = ClobClient(CLOB_HOST)
-
+# ======================
+# Helper Functions
+# ======================
 def fetch_all_markets():
+    """Fetch all active, open markets from Polymarket Gamma API."""
     markets = []
     offset = 0
-    limit = 500
-    while True:
-        params = {"active": "true", "closed": "false", "limit": limit, "offset": offset}
-        resp = requests.get(GAMMA_API, params=params)
-        if resp.status_code != 200:
-            st.error(f"Gamma API error: {resp.status_code} - {resp.text}")
-            return []
-        data = resp.json()
-        markets.extend(data)
-        if len(data) < limit:
-            break
-        offset += limit
+    limit = 500  # Max per request
+    
+    with st.spinner("Fetching markets from Polymarket..."):
+        while True:
+            params = {
+                "active": "true",
+                "closed": "false",
+                "limit": limit,
+                "offset": offset
+            }
+            response = requests.get(GAMMA_API, params=params)
+            
+            if response.status_code != 200:
+                st.error(f"Error fetching markets: {response.status_code} – {response.text}")
+                return []
+            
+            data = response.json()
+            if not data:
+                break
+                
+            markets.extend(data)
+            st.info(f"Fetched {len(data)} markets (total: {len(markets)})")
+            
+            if len(data) < limit:
+                break
+                
+            offset += limit
+            
+    st.success(f"Successfully loaded {len(markets)} active markets.")
     return markets
 
+
 def detect_arbitrage(markets, threshold=0.02):
+    """Scan binary markets for arb: best_ask_yes + best_ask_no < 1 - threshold."""
     arbs = []
-    for market in markets:
+    total_scanned = 0
+    
+    progress_bar = st.progress(0)
+    
+    for idx, market in enumerate(markets):
+        progress_bar.progress((idx + 1) / len(markets))
+        
+        total_scanned += 1
+        
+        # Only consider binary markets with exactly 2 outcomes
         clob_token_ids = market.get("clobTokenIds", [])
         if len(clob_token_ids) != 2:
-            continue  # Skip non-binary
+            continue
+            
         yes_token, no_token = clob_token_ids
         
-        yes_book = public_client.get_order_book(yes_token)
-        no_book = public_client.get_order_book(no_token)
+        # Fetch order books directly via REST
+        yes_resp = requests.get(f"{CLOB_ORDERBOOK}?token_id={yes_token}")
+        no_resp = requests.get(f"{CLOB_ORDERBOOK}?token_id={no_token}")
+        
+        if yes_resp.status_code != 200 or no_resp.status_code != 200:
+            continue
+            
+        yes_book = yes_resp.json()
+        no_book = no_resp.json()
         
         yes_asks = yes_book.get("asks", [])
         no_asks = no_book.get("asks", [])
+        
         if not yes_asks or not no_asks:
             continue
         
-        best_ask_yes = float(yes_asks[0][0])
-        best_ask_no = float(no_asks[0][0])
+        # Best (lowest) ask price for each side
+        best_ask_yes = float(min(yes_asks, key=lambda x: float(x[0]))[0])
+        best_ask_no = float(min(no_asks, key=lambda x: float(x[0]))[0])
         
         total_cost = best_ask_yes + best_ask_no
+        
         if total_cost < 1 - threshold:
-            profit = 1 - total_cost
+            profit_per_dollar = 1 - total_cost
             arbs.append({
-                "question": market["question"],
-                "yes_token": yes_token,
-                "no_token": no_token,
-                "best_ask_yes": best_ask_yes,
-                "best_ask_no": best_ask_no,
-                "total_cost": total_cost,
-                "profit_per_dollar": profit,
-                "volume": market.get("volume", 0),
+                "Question": market["question"],
+                "YES Price": round(best_ask_yes, 4),
+                "NO Price": round(best_ask_no, 4),
+                "Total Cost": round(total_cost, 4),
+                "Profit %": round(profit_per_dollar * 100, 2),
+                "Est. Profit/$100": round(profit_per_dollar * 100, 2),
+                "Volume": f"${float(market.get('volume', 0)):,.0f}",
+                "Market ID": market.get("id", "N/A")
             })
+    
+    progress_bar.empty()
     return arbs
 
-st.title("Polymarket Arb Bot MVP")
 
-st.header("Arbitrage Scanner")
-threshold = st.slider("Profit Threshold (after gas/slippage)", 0.0, 0.1, 0.02, 0.005)
+# ======================
+# Streamlit Dashboard
+# ======================
+st.set_page_config(page_title="Polymarket Arb Scanner", layout="wide")
+st.title("🔍 Polymarket Arbitrage Scanner MVP")
+st.markdown("Scans all active binary markets for YES + NO pricing inefficiencies (post-gas threshold).")
 
-if st.button("Scan Markets Now"):
-    with st.spinner("Fetching all active markets..."):
+# Controls
+col1, col2 = st.columns([1, 3])
+with col1:
+    threshold = st.slider(
+        "Profit Threshold % (covers gas/slippage)",
+        min_value=0.0,
+        max_value=10.0,
+        value=2.0,
+        step=0.1,
+        help="Only show opportunities with at least this % profit after estimated costs."
+    ) / 100
+
+with col2:
+    st.markdown("#### Scan Controls")
+    if st.button("🚀 Scan All Markets Now", type="primary"):
         markets = fetch_all_markets()
-        st.info(f"Fetched {len(markets)} active markets.")
-    with st.spinner("Scanning for arbs..."):
-        arbs = detect_arbitrage(markets, threshold)
-    if arbs:
-        st.success(f"Found {len(arbs)} arbitrage opportunities!")
-        st.dataframe(arbs)
-    else:
-        st.warning("No opportunities found right now. Try a lower threshold or scan again.")
+        if markets:
+            with st.spinner("Analyzing order books for arbitrage..."):
+                arbs = detect_arbitrage(markets, threshold)
+            
+            if arbs:
+                st.success(f"🎯 Found {len(arbs)} arbitrage opportunities!")
+                st.dataframe(arbs, use_container_width=True)
+                
+                # Download option
+                st.download_button(
+                    "Download Results as CSV",
+                    data="\n".join([",".join(map(str, row.values())) for row in arbs]),
+                    file_name=f"polymarket_arbs_{time.strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.warning("No arbitrage opportunities found at current threshold. Try lowering it or scan again later.")
 
-if st.checkbox("Auto-scan every 15 seconds (for monitoring)"):
-    time.sleep(15)
+# Auto-refresh
+if st.checkbox("🔄 Auto-refresh every 20 seconds (for monitoring)"):
+    time.sleep(20)
     st.experimental_rerun()
 
-st.header("Execution (Use dummy wallet!)")
-st.warning("Private key is loaded from secrets - never commit it to GitHub!")
+# Execution Note
+st.markdown("---")
+st.header("📈 Execution")
+st.info("""
+**Auto-trading is not included in this cloud version** (to avoid key exposure and SDK issues).
 
-if "arbs" not in locals():
-    arbs = []
+**Manual execution recommended**:
+1. Copy a market from the table above.
+2. Go to Polymarket.com → find the market.
+3. Place limit buys at the displayed YES/NO prices (or better).
 
-if arbs:
-    selected_question = st.selectbox("Select market to arbitrage", [a["question"] for a in arbs])
-    usdc_amount = st.number_input("Total USDC to spend (split between YES/NO)", min_value=1.0, value=10.0)
+**For auto-trading later**: We'll build a separate local Python script (using `py-clob-client` on your machine/VPS with Python 3.11) that can execute instantly when an arb is detected.
+""")
 
-    if st.button("Execute Arbitrage"):
-        try:
-            private_key = st.secrets["polymarket"]["private_key"]
-            funder = st.secrets["polymarket"].get("funder_address", None)
-            sig_type = st.secrets["polymarket"].get("signature_type", 1)
-        except:
-            st.error("Secrets not configured! Add to .streamlit/secrets.toml locally or in Cloud settings.")
-            st.stop()
-
-        arb = next(a for a in arbs if a["question"] == selected_question)
-
-        with st.spinner("Authenticating wallet..."):
-            auth_client = ClobClient(
-                CLOB_HOST,
-                key=private_key,
-                chain_id=CHAIN_ID,
-                signature_type=sig_type,
-                funder=funder
-            )
-            auth_client.set_api_creds(auth_client.create_or_derive_api_creds())
-
-        yes_size = (usdc_amount / 2) / arb["best_ask_yes"]
-        no_size = (usdc_amount / 2) / arb["best_ask_no"]
-
-        try:
-            # YES order
-            yes_args = OrderArgs(token_id=arb["yes_token"], price=arb["best_ask_yes"], size=yes_size, side=BUY)
-            signed_yes = auth_client.create_order(yes_args)
-            resp_yes = auth_client.post_order(signed_yes, OrderType.GTC)
-            st.json(resp_yes)
-
-            # NO order
-            no_args = OrderArgs(token_id=arb["no_token"], price=arb["best_ask_no"], size=no_size, side=BUY)
-            signed_no = auth_client.create_order(no_args)
-            resp_no = auth_client.post_order(signed_no, OrderType.GTC)
-            st.json(resp_no)
-
-            st.success("Orders placed successfully!")
-        except Exception as e:
-            st.error(f"Trade error: {e}")
+st.caption("Built with ❤️ for prediction market edge hunters | Dec 2025")
