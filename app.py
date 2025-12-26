@@ -1,168 +1,138 @@
 import streamlit as st
 import requests
 import time
+import aiohttp
+import asyncio
+from fuzzywuzzy import fuzz, process
 
-# ======================
 # Constants
-# ======================
 GAMMA_API = "https://gamma-api.polymarket.com/markets"
 CLOB_ORDERBOOK = "https://clob.polymarket.com/orderbook"
+DRIFT_CONTRACTS = "https://data.api.drift.trade/contracts"
 
-# ======================
-# Helper Functions
-# ======================
-def fetch_all_markets():
-    """Fetch all active, open markets from Polymarket Gamma API."""
+async def async_get(session, url, params=None):
+    async with session.get(url, params=params) as resp:
+        return await resp.json() if resp.status == 200 else []
+
+def fetch_drift_markets():
+    """Fetch Drift BET markets (binary prediction perps)."""
+    try:
+        resp = requests.get(DRIFT_CONTRACTS)
+        if resp.status_code != 200:
+            return []
+        contracts = resp.json().get("contracts", [])
+        drift_markets = []
+        for c in contracts:
+            if "-BET" in c.get("ticker_id", ""):
+                question = c["base_currency"].replace("-", " ").title()
+                yes_price = float(c.get("last_price", 0))
+                drift_markets.append({
+                    "question": question,
+                    "yes_price": yes_price,
+                    "no_price": 1 - yes_price,  # Approximate (ignores spread)
+                    "volume": c.get("quote_volume", 0),
+                    "oi": c.get("open_interest", 0),
+                    "ticker": c["ticker_id"]
+                })
+        return drift_markets
+    except:
+        return []
+
+async def fetch_all_polymarket_markets_async():
+    """Async version for faster combined scan."""
     markets = []
     offset = 0
-    limit = 500  # Max per request
-    
-    with st.spinner("Fetching markets from Polymarket..."):
+    limit = 500
+    async with aiohttp.ClientSession() as session:
         while True:
-            params = {
-                "active": "true",
-                "closed": "false",
-                "limit": limit,
-                "offset": offset
-            }
-            response = requests.get(GAMMA_API, params=params)
-            
-            if response.status_code != 200:
-                st.error(f"Error fetching markets: {response.status_code} – {response.text}")
-                return []
-            
-            data = response.json()
+            params = {"active": "true", "closed": "false", "limit": limit, "offset": offset}
+            data = await async_get(session, GAMMA_API, params)
             if not data:
                 break
-                
             markets.extend(data)
-            st.info(f"Fetched {len(data)} markets (total: {len(markets)})")
-            
             if len(data) < limit:
                 break
-                
             offset += limit
-            
-    st.success(f"Successfully loaded {len(markets)} active markets.")
     return markets
 
-
-def detect_arbitrage(markets, threshold=0.02):
-    """Scan binary markets for arb: best_ask_yes + best_ask_no < 1 - threshold."""
-    arbs = []
-    total_scanned = 0
-    
-    progress_bar = st.progress(0)
-    
-    for idx, market in enumerate(markets):
-        progress_bar.progress((idx + 1) / len(markets))
-        
-        total_scanned += 1
-        
-        # Only consider binary markets with exactly 2 outcomes
+def get_poly_best_asks(markets):
+    """Get best ask YES/NO for binary Poly markets (sync for simplicity)."""
+    poly_prices = []
+    for market in markets:
         clob_token_ids = market.get("clobTokenIds", [])
         if len(clob_token_ids) != 2:
             continue
-            
         yes_token, no_token = clob_token_ids
-        
-        # Fetch order books directly via REST
         yes_resp = requests.get(f"{CLOB_ORDERBOOK}?token_id={yes_token}")
         no_resp = requests.get(f"{CLOB_ORDERBOOK}?token_id={no_token}")
-        
         if yes_resp.status_code != 200 or no_resp.status_code != 200:
             continue
-            
         yes_book = yes_resp.json()
         no_book = no_resp.json()
-        
         yes_asks = yes_book.get("asks", [])
         no_asks = no_book.get("asks", [])
-        
         if not yes_asks or not no_asks:
             continue
-        
-        # Best (lowest) ask price for each side
-        best_ask_yes = float(min(yes_asks, key=lambda x: float(x[0]))[0])
-        best_ask_no = float(min(no_asks, key=lambda x: float(x[0]))[0])
-        
-        total_cost = best_ask_yes + best_ask_no
-        
-        if total_cost < 1 - threshold:
-            profit_per_dollar = 1 - total_cost
-            arbs.append({
-                "Question": market["question"],
-                "YES Price": round(best_ask_yes, 4),
-                "NO Price": round(best_ask_no, 4),
-                "Total Cost": round(total_cost, 4),
-                "Profit %": round(profit_per_dollar * 100, 2),
-                "Est. Profit/$100": round(profit_per_dollar * 100, 2),
-                "Volume": f"${float(market.get('volume', 0)):,.0f}",
-                "Market ID": market.get("id", "N/A")
-            })
-    
-    progress_bar.empty()
+        best_yes = float(min(yes_asks, key=lambda x: float(x[0]))[0])
+        best_no = float(min(no_asks, key=lambda x: float(x[0]))[0])
+        poly_prices.append({
+            "question": market["question"],
+            "yes_price": best_yes,
+            "no_price": best_no,
+            "volume": market.get("volume", 0)
+        })
+    return poly_prices
+
+def find_cross_arbs(poly_prices, drift_markets, match_threshold=70, profit_threshold=0.03):
+    arbs = []
+    for drift in drift_markets:
+        # Fuzzy match question
+        match = process.extractOne(drift["question"], [p["question"] for p in poly_prices], scorer=fuzz.partial_ratio)
+        if match and match[1] >= match_threshold:
+            poly = next(p for p in poly_prices if p["question"] == match[0])
+            diff_yes = abs(poly["yes_price"] - drift["yes_price"])
+            if diff_yes > profit_threshold:
+                cheaper = "Drift" if drift["yes_price"] < poly["yes_price"] else "Polymarket"
+                arbs.append({
+                    "Event": drift["question"],
+                    "Poly YES": round(poly["yes_price"], 4),
+                    "Drift YES": round(drift["yes_price"], 4),
+                    "Spread": round(diff_yes * 100, 2),
+                    "Cheaper Platform": cheaper,
+                    "Potential Profit %": round(diff_yes * 100, 2)
+                })
     return arbs
 
+# Dashboard
+st.title("🔍 Polymarket + Drift BET Cross-Platform Arb Scanner")
 
-# ======================
-# Streamlit Dashboard
-# ======================
-st.set_page_config(page_title="Polymarket Arb Scanner", layout="wide")
-st.title("🔍 Polymarket Arbitrage Scanner MVP")
-st.markdown("Scans all active binary markets for YES + NO pricing inefficiencies (post-gas threshold).")
+threshold = st.slider("Min Spread % for Arb Alert", 1.0, 10.0, 3.0) / 100
 
-# Controls
-col1, col2 = st.columns([1, 3])
-with col1:
-    threshold = st.slider(
-        "Profit Threshold % (covers gas/slippage)",
-        min_value=0.0,
-        max_value=10.0,
-        value=2.0,
-        step=0.1,
-        help="Only show opportunities with at least this % profit after estimated costs."
-    ) / 100
-
-with col2:
-    st.markdown("#### Scan Controls")
-    if st.button("🚀 Scan All Markets Now", type="primary"):
-        markets = fetch_all_markets()
-        if markets:
-            with st.spinner("Analyzing order books for arbitrage..."):
-                arbs = detect_arbitrage(markets, threshold)
-            
-            if arbs:
-                st.success(f"🎯 Found {len(arbs)} arbitrage opportunities!")
-                st.dataframe(arbs, use_container_width=True)
-                
-                # Download option
-                st.download_button(
-                    "Download Results as CSV",
-                    data="\n".join([",".join(map(str, row.values())) for row in arbs]),
-                    file_name=f"polymarket_arbs_{time.strftime('%Y%m%d_%H%M')}.csv",
-                    mime="text/csv"
-                )
-            else:
-                st.warning("No arbitrage opportunities found at current threshold. Try lowering it or scan again later.")
+if st.button("🚀 Scan Both Platforms Now"):
+    with st.spinner("Fetching Polymarket markets..."):
+        loop = asyncio.new_event_loop()
+        poly_markets = loop.run_until_complete(fetch_all_polymarket_markets_async())
+    
+    with st.spinner("Fetching Drift BET markets..."):
+        drift_markets = fetch_drift_markets()
+        st.info(f"Found {len(drift_markets)} Drift BET markets.")
+    
+    with st.spinner("Getting Polymarket prices..."):
+        poly_prices = get_poly_best_asks(poly_markets)
+        st.info(f"Processed {len(poly_prices)} binary Polymarket markets.")
+    
+    with st.spinner("Matching & detecting cross-arbs..."):
+        cross_arbs = find_cross_arbs(poly_prices, drift_markets, profit_threshold=threshold)
+    
+    if cross_arbs:
+        st.success(f"🎯 Found {len(cross_arbs)} cross-platform opportunities!")
+        st.dataframe(cross_arbs)
+    else:
+        st.warning("No cross-arbs at current threshold. Try lowering or scan later—opps appear during news/volatility.")
 
 # Auto-refresh
-if st.checkbox("🔄 Auto-refresh every 20 seconds (for monitoring)"):
-    time.sleep(20)
+if st.checkbox("🔄 Auto-scan every 60 seconds"):
+    time.sleep(60)
     st.experimental_rerun()
 
-# Execution Note
-st.markdown("---")
-st.header("📈 Execution")
-st.info("""
-**Auto-trading is not included in this cloud version** (to avoid key exposure and SDK issues).
-
-**Manual execution recommended**:
-1. Copy a market from the table above.
-2. Go to Polymarket.com → find the market.
-3. Place limit buys at the displayed YES/NO prices (or better).
-
-**For auto-trading later**: We'll build a separate local Python script (using `py-clob-client` on your machine/VPS with Python 3.11) that can execute instantly when an arb is detected.
-""")
-
-st.caption("Built with ❤️ for prediction market edge hunters | Dec 2025")
+st.info("Manual trade: Buy YES on cheaper platform. Windows last minutes+ due to Drift's thinner liquidity.")
