@@ -1,4 +1,2 @@
 streamlit
 requests
-fuzzywuzzy
-python-levenshtein
